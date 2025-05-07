@@ -4,8 +4,8 @@ fairscale==0.4.4
 fvcore==0.1.5.post20221221
 imageio==2.34.1
 matplotlib==3.8.4
-MultiScaleDeformableAttention==1.0
-numpy==1.23.5
+# MultiScaleDeformableAttention==1.0
+numpy
 numpy_quaternion==2023.0.3
 omegaconf==2.3.0
 open3d==0.18.0
@@ -16,11 +16,11 @@ pathfinding==1.0.9
 Pillow==10.4.0
 Requests==2.32.3
 salesforce_lavis==1.0.2
-scipy==1.14.1
+scipy
 setuptools==60.2.0
 timm==0.4.12
-torch==2.2.2+cu121
-torchvision==0.17.2+cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
 tqdm==4.65.2
 transformers==4.26.1
 xformers==0.0.28.post1

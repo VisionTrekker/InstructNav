@@ -140,6 +140,7 @@ class HM3D_Objnav_Agent:
     def query_chainon(self):
         semantic_clue = {'observed object':self.observed_objects}
         query_content = "<Navigation Instruction>:{}, <Previous Plan>:{}, <Semantic Clue>:{}".format(self.instruct_goal,"{" + self.trajectory_summary + "}",semantic_clue)
+        print(f"query_content: {query_content}")
         self.gpt_trajectory.append("Input:\n%s \n"%query_content)
         for i in range(10):
             try:

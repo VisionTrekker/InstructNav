@@ -16,7 +16,7 @@ class Instruct_Mapper:
                  pcd_resolution=0.05,
                  grid_resolution=0.1,
                  grid_size=5,
-                 floor_height=-0.8,
+                 floor_height=-0.4,  # -0.8
                  ceiling_height=0.8,
                  translation_func=habitat_translation,
                  rotation_func=habitat_rotation,
@@ -47,46 +47,63 @@ class Instruct_Mapper:
         self.trajectory_position = []
     
     def update(self,rgb,depth,position,rotation):
-        self.current_position = self.translation_func(position) - self.initial_position
-        self.current_rotation = self.rotation_func(rotation)
-        self.current_depth = preprocess_depth(depth)
-        self.current_rgb = preprocess_image(rgb)
+        self.current_position = self.translation_func(position) - self.initial_position  # (3,)
+        self.current_rotation = self.rotation_func(rotation)  # (3, 3)
+        self.current_depth = preprocess_depth(depth)  # (H, W, 1)
+        self.current_rgb = preprocess_image(rgb)  # (H, W, 3)
         self.trajectory_position.append(self.current_position)
+        # 生成当前位置的点云
         # to avoid there is no valid depth value (especially in real-world)
         if np.sum(self.current_depth) > 0:
-            camera_points,camera_colors = get_pointcloud_from_depth(self.current_rgb,self.current_depth,self.camera_intrinsic)
-            world_points = translate_to_world(camera_points,self.current_position,self.current_rotation)
+            camera_points,camera_colors = get_pointcloud_from_depth(self.current_rgb,self.current_depth,self.camera_intrinsic)  # both (H*W, 3)
+            world_points = translate_to_world(camera_points,self.current_position,self.current_rotation)  # (H*W, 3)
             self.current_pcd = gpu_pointcloud_from_array(world_points,camera_colors,self.pcd_device).voxel_down_sample(self.pcd_resolution)
         else:
             return
-        # semantic masking and project object mask to pointcloud
-        classes,masks,confidences,visualization = self.object_percevior.perceive(self.current_rgb)
-        self.segmentation = visualization[0]
-        current_object_entities = self.get_object_entities(self.current_depth,classes,masks,confidences)
-        self.object_entities = self.associate_object_entities(self.object_entities,current_object_entities)
-        self.object_pcd = self.update_object_pcd()
+        #  使用GLEE进行语义分割
+        #  获取到 semantic masking and project object mask to pointcloud
+        classes,masks,confidences,visualization = self.object_percevior.perceive(self.current_rgb)  # 分别为 np(0,)  np(0, H, W)  tensor(0,)  list(1)->np(H, W, 3)
+        self.segmentation = visualization[0]  # np(H, W, 3)
+        current_object_entities = self.get_object_entities(self.current_depth,classes,masks,confidences)  # list[]
+        self.object_entities = self.associate_object_entities(self.object_entities,current_object_entities)  # list[]
+        self.object_pcd = self.update_object_pcd()  # 0 point
+
         # pointcloud update
-        self.scene_pcd = gpu_merge_pointcloud(self.current_pcd,self.scene_pcd).voxel_down_sample(self.pcd_resolution)
-        self.scene_pcd = self.scene_pcd.select_by_index((self.scene_pcd.point.positions[:,2]>self.floor_height-0.2).nonzero()[0])
-        self.useful_pcd = self.scene_pcd.select_by_index((self.scene_pcd.point.positions[:,2]<self.ceiling_height).nonzero()[0])
-        
+        self.scene_pcd = gpu_merge_pointcloud(self.current_pcd,self.scene_pcd).voxel_down_sample(self.pcd_resolution)  # 融合更新到 全部场景点云
+        self.scene_pcd = self.scene_pcd.select_by_index((self.scene_pcd.point.positions[:,2]>self.floor_height-0.2).nonzero()[0])  # 筛选出高度 > 地面高度(-0.8) - 0.2的 点云
+        self.useful_pcd = self.scene_pcd.select_by_index((self.scene_pcd.point.positions[:,2]<self.ceiling_height).nonzero()[0])  # 筛选出高度 < 天花板高度(0.8)的 点云
+
+        # 融合更新所有 可导航点云
         # all the stairs will be regarded as navigable
         for entity in current_object_entities:
-            if entity['class'] == 'stairs':
+            if entity['class'] == 'stairs':  # 将所有楼梯视为可导航点云
                 self.navigable_pcd = gpu_merge_pointcloud(self.navigable_pcd,entity['pcd'])
-        # geometry 
-        current_navigable_point = self.current_pcd.select_by_index((self.current_pcd.point.positions[:,2]<self.floor_height).nonzero()[0])
+        # 获取当前可导航的3D点
+        current_navigable_point = self.current_pcd.select_by_index((self.current_pcd.point.positions[:,2]<self.floor_height).nonzero()[0])  # 当前位置的 高度 < 地面高度的 点云
         current_navigable_position = current_navigable_point.point.positions.cpu().numpy()
-        standing_position = np.array([self.current_position[0],self.current_position[1],current_navigable_position[:,2].mean()])
-        interpolate_points = np.linspace(np.ones_like(current_navigable_position)*standing_position,current_navigable_position,25).reshape(-1,3)
-        interpolate_points = interpolate_points[(interpolate_points[:,2] > self.floor_height-0.2) & (interpolate_points[:,2] < self.floor_height+0.2)]
-        interpolate_colors = np.ones_like(interpolate_points) * 100
+        # 计算 当前站立位置 = (当前位置x, 当前位置y, 当前可导航的点云的高度均值)
+        if current_navigable_position.size == 0:
+            standing_position = np.array([self.current_position[0], self.current_position[1], self.floor_height])
+        else:
+            standing_position = np.array([self.current_position[0], self.current_position[1], current_navigable_position[:, 2].mean()])
+
+        # 在当前站立位置 和 可导航3D点 之间生成插值点
+        interpolate_points = np.linspace(np.ones_like(current_navigable_position)*standing_position,current_navigable_position,25).reshape(-1,3)  # 生成 25 个在 起始点（np.ones_like(current_navigable_position)*standing_position） 和 终点（current_navigable_position） 之间线性插值的点
+        interpolate_points = interpolate_points[(interpolate_points[:,2] > self.floor_height-0.2) & (interpolate_points[:,2] < self.floor_height+0.2)]  # 筛选出高度在 (地面高度-0.2, 地面高度+0.2) 的插值点云
+        interpolate_colors = np.ones_like(interpolate_points) * 100  # 颜色初始化为 (100, 100, 100)
         try:
-            current_navigable_pcd = gpu_pointcloud_from_array(interpolate_points,interpolate_colors,self.pcd_device).voxel_down_sample(self.grid_resolution)
-            self.navigable_pcd = gpu_merge_pointcloud(self.navigable_pcd,current_navigable_pcd).voxel_down_sample(self.pcd_resolution)
-        except:
-            self.navigable_pcd = self.useful_pcd.select_by_index((self.useful_pcd.point.positions[:,2]<self.floor_height).nonzero()[0])
-       
+            # 将这些插值点作为 当前可导航点云（颜色为 (100, 100, 100)）
+            current_navigable_pcd = gpu_pointcloud_from_array(interpolate_points, interpolate_colors, self.pcd_device)
+            if current_navigable_pcd.point.positions.shape[0] > 0:  # 非空
+                current_navigable_pcd = current_navigable_pcd.voxel_down_sample(self.grid_resolution)
+                self.navigable_pcd = gpu_merge_pointcloud(self.navigable_pcd, current_navigable_pcd)  # 融合更新到 全部可导航点云
+                if self.navigable_pcd.point.positions.shape[0] > 100000:  # 限制点云大小
+                    self.navigable_pcd = self.navigable_pcd.voxel_down_sample(self.pcd_resolution * 2)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("Warning: CUDA OOM, clearing point cloud cache")
+                torch.cuda.empty_cache()
+                self.navigable_pcd = self.useful_pcd.select_by_index((self.useful_pcd.point.positions[:, 2] < self.floor_height).nonzero()[0])  # 高度 < 地面高度的 点云
         
         # try:
         #     self.navigable_pcd = self.navigable_pcd.voxel_down_sample(self.pcd_resolution)
@@ -95,12 +112,12 @@ class Instruct_Mapper:
         #print("Warning: hello world")
         # self.navigable_pcd = self.useful_pcd.select_by_index((self.useful_pcd.point.positions[:,2]<self.floor_height).nonzero()[0])
             
-        # filter the obstacle pointcloud
+        # filter the obstacle pointcloud 障碍点： > 地面高度 + 0.1 的点云
         self.obstacle_pcd = self.useful_pcd.select_by_index((self.useful_pcd.point.positions[:,2]>self.floor_height+0.1).nonzero()[0])
-        self.trajectory_pcd = gpu_pointcloud_from_array(np.array(self.trajectory_position),np.zeros((len(self.trajectory_position),3)),self.pcd_device)
+        self.trajectory_pcd = gpu_pointcloud_from_array(np.array(self.trajectory_position),np.zeros((len(self.trajectory_position),3)),self.pcd_device)  # 生成轨迹点云（黑色）
         self.frontier_pcd = project_frontier(self.obstacle_pcd,self.navigable_pcd,self.floor_height+0.2,self.grid_resolution)
         self.frontier_pcd[:,2] = self.navigable_pcd.point.positions.cpu().numpy()[:,2].mean()
-        self.frontier_pcd = gpu_pointcloud_from_array(self.frontier_pcd,np.ones((self.frontier_pcd.shape[0],3))*np.array([[255,0,0]]),self.pcd_device)
+        self.frontier_pcd = gpu_pointcloud_from_array(self.frontier_pcd,np.ones((self.frontier_pcd.shape[0],3))*np.array([[255,0,0]]),self.pcd_device)  # 生成前向点云（红色）
         self.update_iterations += 1
     
     def update_object_pcd(self):

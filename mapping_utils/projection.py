@@ -8,6 +8,11 @@ import cv2
 # frontier = 4
 
 def project_frontier(obstacle_pcd,navigable_pcd,obstacle_height=-0.7,grid_resolution=0.25):
+    if not hasattr(navigable_pcd.point, "positions") or navigable_pcd.point.positions is None or \
+            navigable_pcd.point.positions.shape[0] == 0:
+        print("Warning: Empty navigable_pcd, returning empty frontier")
+        return np.empty((0, 3), dtype=np.float32)
+
     np_obstacle_points = obstacle_pcd.point.positions.cpu().numpy()
     np_navigable_points = navigable_pcd.point.positions.cpu().numpy()
     np_all_points = np.concatenate((np_obstacle_points,np_navigable_points),axis=0)
